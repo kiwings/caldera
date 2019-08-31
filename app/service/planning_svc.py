@@ -14,40 +14,75 @@ class PlanningService(BaseService):
         self.log = self.add_service('planning_svc', self)
 
     async def select_links(self, operation, agent, phase):
+        """
+        For an operation, phase and agent combination, determine which potential links can be executed
+        :param operation:
+        :param agent:
+        :param phase:
+        :return: a list of links
+        """
+        if (not agent['trusted']) and (not operation['allow_untrusted']):
+            self.log.debug('Agent %s untrusted: no link created' % agent['paw'])
+            return []
         phase_abilities = [i for p, v in operation['adversary']['phases'].items() if p <= phase for i in v]
-        phase_abilities[:] = [p for p in phase_abilities if
-                              agent['platform'] == p['platform'] and agent['executor'] == p['executor']]
         links = []
-        for a in phase_abilities:
+        for a in await self.capable_agent_abilities(phase_abilities, agent):
             links.append(
                 dict(op_id=operation['id'], paw=agent['paw'], ability=a['id'], command=a['test'], score=0,
-                     decide=datetime.now(), jitter=self.jitter(operation['jitter'])))
+                     decide=datetime.now(), executor=a['executor'], jitter=self.jitter(operation['jitter'])))
         links[:] = await self._trim_links(operation, links, agent)
         return [link for link in list(reversed(sorted(links, key=lambda k: k['score'])))]
 
     async def create_cleanup_links(self, operation):
-        for member in operation['host_group']:
+        """
+        For a given operation, create a link for every cleanup action on every executed ability
+        :param operation:
+        :return: None
+        """
+        op = await self.get_service('data_svc').explode_operation(criteria=dict(id=operation['id']))
+        for member in op[0]['host_group']:
+            if (not member['trusted']) and (not op[0]['allow_untrusted']):
+                self.log.debug('Agent %s untrusted: no cleanup-link created' % member['paw'])
+                continue
             links = []
             for link in await self.get_service('data_svc').explode_chain(criteria=dict(paw=member['paw'],
-                                                                     op_id=operation['id'])):
+                                                                                       op_id=op[0]['id'])):
                 ability = (await self.get_service('data_svc').explode_abilities(criteria=dict(id=link['ability'])))[0]
                 if ability['cleanup']:
-                    links.append(dict(op_id=operation['id'], paw=member['paw'], ability=ability['id'], cleanup=1,
-                                      command=ability['cleanup'], score=0, decide=datetime.now(), jitter=0))
-            links[:] = await self._trim_links(operation, links, member)
+                    links.append(dict(op_id=op[0]['id'], paw=member['paw'], ability=ability['id'], cleanup=1,
+                                      command=ability['cleanup'], executor=ability['executor'], score=0,
+                                      decide=datetime.now(), jitter=0))
+            links[:] = await self._trim_links(op[0], links, member)
             for link in reversed(links):
                 link.pop('rewards', [])
-                await self.get_service('data_svc').create_link(link)
+                await self.get_service('data_svc').create('core_chain', link)
+        await self.wait_for_phase(op[0])
 
     async def wait_for_phase(self, operation):
+        """
+        Wait for all started links to be completed
+        :param operation:
+        :return: None
+        """
         for member in operation['host_group']:
-            op = await self.get_service('data_svc').explode_operation(dict(id=operation['id']))
+            if (not member['trusted']) and (not operation['allow_untrusted']):
+                continue
+            op = await self.get_service('data_svc').explode_operation(criteria=dict(id=operation['id']))
             while next((True for lnk in op[0]['chain'] if lnk['paw'] == member['paw'] and not lnk['finish']),
                        False):
                 await asyncio.sleep(3)
-                op = await self.get_service('data_svc').explode_operation(dict(id=operation['id']))
+                if await self._trust_issues(operation, member['paw']):
+                    break
+                op = await self.get_service('data_svc').explode_operation(criteria=dict(id=operation['id']))
 
     async def decode(self, encoded_cmd, agent, group):
+        """
+        Replace all global variables in a command with the values associated to a specific agent
+        :param encoded_cmd:
+        :param agent:
+        :param group:
+        :return: the updated command string
+        """
         decoded_cmd = self.decode_bytes(encoded_cmd)
         decoded_cmd = decoded_cmd.replace('#{server}', agent['server'])
         decoded_cmd = decoded_cmd.replace('#{group}', group)
@@ -89,6 +124,20 @@ class PlanningService(BaseService):
             else:
                 link['command'] = await self._apply_stealth(operation, agent, decoded_test)
         return links
+
+    @staticmethod
+    async def capable_agent_abilities(phase_abilities, agent):
+        abilities = []
+        preferred = next((e['executor'] for e in agent['executors'] if e['preferred']))
+        for ai in set([pa['ability_id'] for pa in phase_abilities]):
+            total_ability = [ab for ab in phase_abilities if ab['ability_id'] == ai]
+            if len(total_ability) > 1:
+                val = next((ta for ta in total_ability if ta['executor'] == preferred), False)
+                if val:
+                    abilities.append(val)
+            elif total_ability[0]['executor'] in [e['executor'] for e in agent['executors']]:
+                abilities.append(total_ability[0])
+        return abilities
 
     """ PRIVATE """
 
@@ -145,3 +194,9 @@ class PlanningService(BaseService):
             for f in facts:
                 agent_facts.append(f['id'])
         return agent_facts
+
+    async def _trust_issues(self, operation, paw):
+        if not operation['allow_untrusted']:
+            agent = await self.get_service('data_svc').explode_agents(criteria=dict(paw=paw))
+            return not agent[0]['trusted']
+        return False
