@@ -47,8 +47,11 @@ class DataService(BaseService):
         """
         for filename in glob.iglob('%s/*.yml' % directory, recursive=True):
             for adv in self.strip_yml(filename):
-                phases = [dict(phase=k, id=i) for k, v in adv['phases'].items() for i in v]
-                await self.create_adversary(adv['id'], adv['name'], adv['description'], phases)
+                phases = [dict(phase=k, id=i) for k, v in adv.get('phases', dict()).items() for i in v]
+                for pack in [await self._add_adversary_packs(p) for p in adv.get('packs', [])]:
+                    phases += pack
+                if adv.get('visible', True):
+                    await self.create_adversary(adv['id'], adv['name'], adv['description'], phases)
 
     async def load_facts(self, directory):
         """
@@ -160,7 +163,7 @@ class DataService(BaseService):
         :return: the database id
         """
         identifier = await self.dao.create('core_adversary',
-                                           dict(adversary_id=i, name=name.lower(), description=description))
+                                           dict(adversary_id=i, name=name, description=description))
 
         await self.dao.delete('core_adversary_map', data=dict(adversary_id=i))
         for ability in phases:
@@ -168,25 +171,25 @@ class DataService(BaseService):
             await self.dao.create('core_adversary_map', a)
         return identifier
 
-    async def create_operation(self, name, group, adversary_id, jitter='2/8', stealth=False, sources=[],
-                               planner=None, state=None, allow_untrusted=False):
+    async def create_operation(self, name, group, adversary_id, jitter='2/8', sources=[],
+                               planner=None, state=None, allow_untrusted=False, autonomous=True):
         """
         Save a new operation to the database
         :param name:
         :param group:
         :param adversary_id:
         :param jitter:
-        :param stealth:
         :param sources:
         :param planner:
         :param state:
         :param allow_untrusted:
+        :param autonomous
         :return: the database id
         """
         op_id = await self.dao.create('core_operation', dict(
             name=name, host_group=group, adversary_id=adversary_id, finish=None, phase=0, jitter=jitter,
-            start=self.get_current_timestamp(), stealth=stealth, planner=planner, state=state,
-            allow_untrusted=allow_untrusted))
+            start=self.get_current_timestamp(), planner=planner, state=state,
+            allow_untrusted=allow_untrusted, autonomous=autonomous))
         source_id = await self.dao.create('core_source', dict(name=name))
         await self.dao.create('core_source_map', dict(op_id=op_id, source_id=source_id))
         for s_id in [s for s in sources if s]:
@@ -263,6 +266,7 @@ class DataService(BaseService):
             phases = defaultdict(list)
             for t in await self.dao.get('core_adversary_map', dict(adversary_id=adv['adversary_id'])):
                 for ability in await self.explode_abilities(dict(ability_id=t['ability_id'])):
+                    ability['adversary_map_id'] = t['id']
                     phases[t['phase']].append(ability)
             adv['phases'] = dict(phases)
         return adversaries
@@ -378,7 +382,8 @@ class DataService(BaseService):
                             await self.create_ability(ability_id=ab.get('id'), tactic=ab['tactic'].lower(),
                                                       technique_name=ab['technique']['name'],
                                                       technique_id=ab['technique']['attack_id'],
-                                                      test=encoded_test.decode(), description=ab.get('description'),
+                                                      test=encoded_test.decode(),
+                                                      description=ab.get('description') or '',
                                                       executor=e, name=ab['name'], platform=pl,
                                                       cleanup=b64encode(
                                                           info['cleanup'].strip().encode(
@@ -402,3 +407,8 @@ class DataService(BaseService):
                     await self.dao.delete('core_ability', dict(id=saved['id']))
             if saved['platform'] not in ability['platforms']:
                 await self.dao.delete('core_ability', dict(id=saved['id']))
+
+    async def _add_adversary_packs(self, pack):
+        _, filename = await self.get_service('file_svc').find_file_path('%s.yml' % pack, location='data')
+        for adv in self.strip_yml(filename):
+            return [dict(phase=k, id=i) for k, v in adv.get('phases').items() for i in v]

@@ -28,13 +28,17 @@ class PlanningService(BaseService):
             self.log.debug('Agent %s untrusted: no link created' % agent['paw'])
             return []
         phase_abilities = [i for p, v in operation['adversary']['phases'].items() if p <= phase for i in v]
+        phase_abilities = sorted(phase_abilities, key=lambda i: i['id'])
+        link_status = await self._default_link_status(operation)
+
         links = []
         for a in await self.capable_agent_abilities(phase_abilities, agent):
             links.append(
                 dict(op_id=operation['id'], paw=agent['paw'], ability=a['id'], command=a['test'], score=0,
-                     decide=datetime.now(), executor=a['executor'], jitter=self.jitter(operation['jitter'])))
+                     status=link_status, decide=datetime.now(), executor=a['executor'],
+                     jitter=self.jitter(operation['jitter']), adversary_map_id=a['adversary_map_id']))
         links[:] = await self._trim_links(operation, links, agent)
-        return [link for link in list(reversed(sorted(links, key=lambda k: k['score'])))]
+        return await self._sort_links(links)
 
     async def create_cleanup_links(self, operation):
         """
@@ -42,24 +46,25 @@ class PlanningService(BaseService):
         :param operation:
         :return: None
         """
-        op = await self.get_service('data_svc').explode_operation(criteria=dict(id=operation['id']))
-        for member in op[0]['host_group']:
-            if (not member['trusted']) and (not op[0]['allow_untrusted']):
+        op = (await self.get_service('data_svc').explode_operation(criteria=dict(id=operation['id'])))[0]
+        link_status = await self._default_link_status(op)
+        for member in op['host_group']:
+            if (not member['trusted']) and (not op['allow_untrusted']):
                 self.log.debug('Agent %s untrusted: no cleanup-link created' % member['paw'])
                 continue
             links = []
             for link in await self.get_service('data_svc').explode_chain(criteria=dict(paw=member['paw'],
-                                                                                       op_id=op[0]['id'])):
+                                                                                       op_id=op['id'])):
                 ability = (await self.get_service('data_svc').explode_abilities(criteria=dict(id=link['ability'])))[0]
-                if ability['cleanup']:
-                    links.append(dict(op_id=op[0]['id'], paw=member['paw'], ability=ability['id'], cleanup=1,
-                                      command=ability['cleanup'], executor=ability['executor'], score=0,
-                                      decide=datetime.now(), jitter=0))
-            links[:] = await self._trim_links(op[0], links, member)
+                if ability['cleanup'] and link['status'] >= 0:
+                    links.append(dict(op_id=op['id'], paw=member['paw'], ability=ability['id'], cleanup=1,
+                                      command=ability['cleanup'], executor=ability['executor'], score=0, jitter=0,
+                                      decide=datetime.now(), status=link_status))
+            links[:] = await self._trim_links(op, links, member)
             for link in reversed(links):
                 link.pop('rewards', [])
                 await self.get_service('data_svc').create('core_chain', link)
-        await self.wait_for_phase(op[0])
+        await self.wait_for_phase(op)
 
     async def wait_for_phase(self, operation):
         """
@@ -71,7 +76,7 @@ class PlanningService(BaseService):
             if (not member['trusted']) and (not operation['allow_untrusted']):
                 continue
             op = await self.get_service('data_svc').explode_operation(criteria=dict(id=operation['id']))
-            while next((True for lnk in op[0]['chain'] if lnk['paw'] == member['paw'] and not lnk['finish']),
+            while next((True for lnk in op[0]['chain'] if lnk['paw'] == member['paw'] and not lnk['finish'] and not lnk['status'] == self.LinkState.DISCARD.value),
                        False):
                 await asyncio.sleep(3)
                 if await self._trust_issues(operation, member['paw']):
@@ -93,10 +98,30 @@ class PlanningService(BaseService):
         decoded_cmd = decoded_cmd.replace('#{location}', agent['location'])
         return decoded_cmd
 
+    @staticmethod
+    async def capable_agent_abilities(phase_abilities, agent):
+        abilities = []
+        preferred = next((e['executor'] for e in agent['executors'] if e['preferred']))
+        executors = [e['executor'] for e in agent['executors']]
+        for ai in set([pa['ability_id'] for pa in phase_abilities]):
+            total_ability = [ab for ab in phase_abilities if (ab['ability_id'] == ai)
+                             and (ab['platform'] == agent['platform']) and (ab['executor'] in executors)]
+            if len(total_ability) > 0:
+                val = next((ta for ta in total_ability if ta['executor'] == preferred), total_ability[0])
+                abilities.append(val)
+        return abilities
+
     """ PRIVATE """
 
+    @staticmethod
+    async def _sort_links(links):
+        """
+        sort links by their score then by the order they are defined in an adversary profile
+        """
+        return sorted(links, key=lambda k: (-k['score'], k['adversary_map_id']))
+
     async def _trim_links(self, operation, links, agent):
-        host_already_ran = [l['command'] for l in operation['chain'] if l['paw'] == agent['paw'] and l['collect']]
+        host_already_ran = [l['command'] for l in operation['chain'] if l['paw'] == agent['paw']]
         links[:] = await self._add_test_variants(links, agent, operation)
         links[:] = [l for l in links if l['command'] not in host_already_ran]
         links[:] = [l for l in links if
@@ -120,28 +145,13 @@ class PlanningService(BaseService):
                     copy_link = copy.deepcopy(link)
 
                     variant, score, rewards = await self._build_single_test_variant(copy_test, combo)
-                    copy_link['command'] = await self._apply_stealth(operation, agent, variant)
+                    copy_link['command'] = self.encode_string(variant)
                     copy_link['score'] = score
                     copy_link['rewards'] = rewards
                     links.append(copy_link)
             else:
-                link['command'] = await self._apply_stealth(operation, agent, decoded_test)
+                link['command'] = self.encode_string(decoded_test)
         return links
-
-    @staticmethod
-    async def capable_agent_abilities(phase_abilities, agent):
-        abilities = []
-        preferred = next((e['executor'] for e in agent['executors'] if e['preferred']))
-        executors = [e['executor'] for e in agent['executors']]
-        for ai in set([pa['ability_id'] for pa in phase_abilities]):
-            total_ability = [ab for ab in phase_abilities if (ab['ability_id'] == ai)
-                             and (ab['platform'] == agent['platform']) and (ab['executor'] in executors)]
-            if len(total_ability) > 0:
-                val = next((ta for ta in total_ability if ta['executor'] == preferred), total_ability[0])
-                abilities.append(val)
-        return abilities
-
-    """ PRIVATE """
 
     @staticmethod
     def _reward_fact_relationship(combo_set, combo_link, score):
@@ -150,7 +160,10 @@ class PlanningService(BaseService):
         return score
 
     @staticmethod
-    async def _build_relevant_facts(variables, facts, agent_facts):
+    def _is_fact_bound(fact):
+        return not fact['link_id']
+
+    async def _build_relevant_facts(self, variables, facts, agent_facts):
         """
         Create a list of ([fact, value, score]) tuples for each variable/fact
         """
@@ -160,7 +173,7 @@ class PlanningService(BaseService):
             variable_facts = []
             for fact in [f for f in facts if f['property'] == v]:
                 if fact['property'].startswith('host'):
-                    if fact['id'] in agent_facts:
+                    if fact['id'] in agent_facts or self._is_fact_bound(fact):
                         variable_facts.append(fact)
                 else:
                     variable_facts.append(fact)
@@ -181,11 +194,6 @@ class PlanningService(BaseService):
         score = self._reward_fact_relationship(combo_set_id, combo_link_id, score)
         return copy_test, score, rewards
 
-    async def _apply_stealth(self, operation, agent, decoded_test):
-        if operation['stealth']:
-            decoded_test = self.apply_stealth(agent['platform'], decoded_test)
-        return self.encode_string(decoded_test)
-
     async def _get_agent_facts(self, op_id, paw):
         """
         Collect a list of this agent's facts
@@ -202,3 +210,6 @@ class PlanningService(BaseService):
             agent = await self.get_service('data_svc').explode_agents(criteria=dict(paw=paw))
             return not agent[0]['trusted']
         return False
+
+    async def _default_link_status(self, operation):
+        return self.LinkState.EXECUTE.value if operation['autonomous'] else self.LinkState.PAUSE.value

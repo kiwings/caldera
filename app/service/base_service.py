@@ -1,11 +1,11 @@
 from base64 import b64encode, b64decode
+from enum import Enum
 from random import randint
 from datetime import datetime
 
 import yaml
 
 from app.utility.logger import Logger
-from app.utility.stealth import obfuscate_ps1, obfuscate_bash
 
 
 class BaseService:
@@ -25,15 +25,8 @@ class BaseService:
         return cls._services
 
     @staticmethod
-    def apply_stealth(executor, code):
-        options = dict(windows=lambda c: obfuscate_ps1(c),
-                       darwin=lambda c: obfuscate_bash(c),
-                       linux=lambda c: obfuscate_bash(c))
-        return options[executor](code)
-
-    @staticmethod
     def decode_bytes(s):
-        return b64decode(s).decode('utf-8').replace('\n', '')
+        return b64decode(s).decode('utf-8', errors='ignore').replace('\n', '')
 
     @staticmethod
     def encode_string(s):
@@ -52,7 +45,7 @@ class BaseService:
     def strip_yml(path):
         if path:
             with open(path, encoding='utf-8') as seed:
-                return list(yaml.load_all(seed))
+                return list(yaml.load_all(seed, Loader=yaml.FullLoader))
         return []
 
     @staticmethod
@@ -65,3 +58,8 @@ class BaseService:
     @staticmethod
     def get_current_timestamp(date_format='%Y-%m-%d %H:%M:%S'):
         return datetime.now().strftime(date_format)
+
+    class LinkState(Enum):
+        EXECUTE = -3
+        DISCARD = -2
+        PAUSE = -1
